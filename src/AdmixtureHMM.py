@@ -10,21 +10,16 @@ class AdmixtureHMM(HMM):
     Implementation of the simple admixture demographic model. The composite likelihood method is used with two admixture
     model to form the following demographic
                  |        sin
-     ----       / \
+                / \       ----
                /   \      mid
-     ----     / --- \
-             /   |   \    2-pop iso
-     ----   /    |    \
+              / --- \     ----
+             /   |        2-pop iso
+            *    *
     """
 
     def __init__(self, parameters, no_mid_states=10, no_ancestral_states=10):
         """
         Initialise a new instance of the class.
-        :param parameters: The isolation time, time between the admixture event and the speciation time, coalescent
-                            rate, recombination rate, and two admixture proportions going from population 1 to 2 and
-                            from population 2 to 1.
-        :param no_mid_states: The number of time slices between the admixture event and the speciation time
-        :param no_ancestral_states: The number of time slices in the ancestral (single population) period
         """
         assert len(parameters) == 6
         self.iso_time, self.mig_time, self.coal_rate, self.recomb_rate, self.p, self.q = parameters
@@ -103,9 +98,9 @@ class AdmixtureHMM(HMM):
 
 def main():
     """
-    Test main that constructs and prints an admixture model
+    Test main
     """
-    model = AdmixtureHMM([0.0001, 0.0001, 1200.0, 0.4, 0.1, 0.2], 2, 2)
+    model = AdmixtureHMM([0.0001, 0.0001, 1200.0, 0.4, 0.1, 0.2], 3, 3)
     print model.emission_matrix
     print model.transition_matrix
     print model.initial_distribution

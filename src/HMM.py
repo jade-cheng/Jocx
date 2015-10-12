@@ -82,9 +82,11 @@ def get_0b(p):
     :return: The matrix slice
     """
     left, right = p.shape
-    assert left == PS.isolation
     assert right in BEGIN
-    return p[[[3]], BEGIN[right]]
+    if left == PS.isolation:
+        return p[[[3]], BEGIN[right]]
+    if left == PS.single:
+        return p[[[6]], BEGIN[right]]
 
 
 def get_0l(p):
@@ -95,9 +97,11 @@ def get_0l(p):
     :return: The matrix slice
     """
     left, right = p.shape
-    assert left == PS.isolation
     assert right in LEFT
-    return p[[[3]], LEFT[right]]
+    if left == PS.isolation:
+        return p[[[3]], LEFT[right]]
+    if left == PS.single:
+        return p[[[6]], LEFT[right]]
 
 
 def get_0e(p):
@@ -108,9 +112,11 @@ def get_0e(p):
     :return: The matrix slice
     """
     left, right = p.shape
-    assert left == PS.isolation
     assert right in END
-    return p[[[3]], END[right]]
+    if left == PS.isolation:
+        return p[[[3]], END[right]]
+    if left == PS.single:
+        return p[[[6]], END[right]]
 
 
 def get_bb(p):
@@ -339,6 +345,7 @@ class ConcatenatedPTable(object):
             self.__sequence[ix] = self.__ps[row] if row == col else \
                 multiply_ps(self[row, col - 1], self.__ps[col])
 
+        # print ix, self.__sequence[ix]
         return self.__sequence[ix]
 
 

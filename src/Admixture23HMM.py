@@ -7,26 +7,20 @@ from HMM import *
 
 class Admixture23HMM(HMM):
     """
-    Implementation of an admixture demographic model. The composite likelihood method is used with two admixture model
-    to form the following demographic
+    Implementation of an admixture demographic model.
                  |        sin
-     ----       / \
+                / \       ----
                /   \      greedy1
-     ----     /\    \
-             /  \   /\    buddy23
-     ----   /    ---  \
-           /      |    \  2-pop iso
-     ---- /       |     \
+              /\    \     ----
+             /  \   /     buddy23
+            /    ---      ----
+           /      |       2-pop iso
+          *       *
     """
 
     def __init__(self, parameters, no_mid_states=10, no_ancestral_states=10):
         """
         Initialise a new instance of the class.
-        :param parameters: The isolation time, the time after the admixture event and before the first speciation
-                            event, the time between two speciation events, coalescent rate, recombination rate, and
-                            the admixture proportion from the admixed population
-        :param no_mid_states: The number of time slices between the two speciation times
-        :param no_ancestral_states: The number of time slices in the ancestral (single population) period
         """
         self.iso_time, self.buddy23_time, self.greedy1_time, self.coal_rate, self.r, self.p = parameters
         self.no_mid_states = no_mid_states
@@ -151,15 +145,12 @@ class Admixture23HMM(HMM):
 
 def main():
     """
-    Test main that constructs and prints an Admixture23 model
+    Test main
     """
     model = Admixture23HMM([0.0001, 0.0001, 0.0001, 1000, 0.4, 0.7], 2, 2)
     print model.initial_distribution
     print model.transition_matrix
     print model.emission_matrix
-
-    # write_model(Admix23([0.001, 0.001, 0.009, 1200, 0.4, 0.9]), 'src1_admix')
-    # write_model(Admix23([0.001, 0.002, 0.008, 1200, 0.4, 0.1]), 'src2_admix')
 
 if __name__ == '__main__':
     main()

@@ -8,14 +8,17 @@ from HMM import *
 class IsolationInitialMigrationHMM(HMM):
     """
     Implementation of the isolation with initial migration demographic model.
+                 |        ancestral (second single)
+                / \      ---------
+               /   \      migration
+              /     \    ---------
+             /       \    isolation
+            *         *
     """
 
     def __init__(self, parameters, no_mig_states=10, no_ancestral_states=10):
         """
         Initialise a new instance of the class.
-        :param parameters: The isolation time, migration, coalescent rate, recombination rate, and migration rate
-        :param no_mig_states: The number of time slices in the migration period
-        :param no_ancestral_states: The number of time slices in the ancestral (single population) period
         """
         assert len(parameters) == 5
         self.iso_time, self.mig_time, self.coal_rate, self.recomb_rate, self.mig_rate = parameters
@@ -60,7 +63,7 @@ class IsolationInitialMigrationHMM(HMM):
 
 def main():
     """
-    Test main that constructs and prints an isolation with initial migration model
+    Test main
     """
     model = IsolationInitialMigrationHMM([0.5, 1.0, 1, 0.4, 0.001], 3, 3)
     print model.emission_matrix

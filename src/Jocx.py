@@ -57,10 +57,22 @@ class Options(object):
         #   bounds_mul   the range with respect to the center points
         #   targets      the center points for the legal parameter ranges
         target_options = {
-            'iso':      (100, [0.0010, 1200.0, 0.4000]),
-            'iim':      (100, [0.0001, 0.0010, 1200.0, 0.400, 250.0]),
-            'admix':    (100, [0.0001, 0.0010, 1200.0, 0.400, 0.900]),
-            'admix23':  (100, [0.0001, 0.0001, 0.0001, 0.001, 1000.0, 0.4, 0.9])
+            'iso':                  (10, [float(e) for e in args[4:][0:3]]),
+            'iim':                  (10, [float(e) for e in args[4:][0:5]]),
+
+            'iso-3hmm':             (10, [float(e) for e in args[4:][0:3]]),
+            'iim-3hmm':             (10, [float(e) for e in args[4:][0:5]]),
+
+            'admix':                (10, [float(e) for e in args[4:][0:5]]),
+            'admix23-1pop':         (10, [float(e) for e in args[4:][0:5]]),
+
+            'admix23-2pop':         (10, [float(e) for e in args[4:][0:6]]),
+            'admix23-2pop-1sample': (10, [float(e) for e in args[4:][0:6]]),
+
+            'admix23':              (10, [float(e) for e in args[4:][0:7]]),
+            'admix23-6hmm':         (10, [float(e) for e in args[4:][0:7]]),
+            'admix23-15hmm':        (10, [float(e) for e in args[4:][0:7]])
+
         }
 
         assert self.model in target_options, 'unsupported model type {0}'.format(self.model)
@@ -71,10 +83,6 @@ def main():
 
     if '--help' in sys.argv:
         print USAGE.format(name=os.path.basename(sys.argv[0]))
-        exit()
-
-    if len(sys.argv) != 4:
-        print 'invalid syntax; try --help'
         exit()
 
     options = Options(sys.argv)

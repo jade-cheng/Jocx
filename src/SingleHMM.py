@@ -5,43 +5,43 @@ from scipy.linalg import expm
 from HMM import *
 
 
-class IsolationHMM(HMM):
+class SingleHMM(HMM):
     """
-    Implementation of the isolation demographic model.
-                 |        ancestral (second single)
-                / \      ---------
-               /   \      isolation
-              *     *
+    Implementation of the following demographic model.
+          |
+          |     single
+         * *
     """
 
-    def __init__(self, parameters, no_ancestral_states=10):
+    def __init__(self, parameters, no_single_states=10):
         """
         Initialise a new instance of the class.
         """
-        assert len(parameters) == 3
-        self.tau, self.coal_rate, self.recomb_rate = parameters
-        self.no_ancestral_states = no_ancestral_states
-        self.q_iso = iso_rate(self.recomb_rate, self.coal_rate)
-        self.q_sin = sin_rate(self.recomb_rate, self.coal_rate)
-        self.sin_breaks = exp_break_points(self.no_ancestral_states, self.coal_rate, self.tau)
+        assert len(parameters) == 2
+        self.c, self.r = parameters
+
+        self.no_single_states = no_single_states
+
+        self.q_sin = sin_rate(self.r, self.c)
+
+        self.sin_breaks = exp_break_points(self.no_single_states, self.c, 0.0)
+        self.hmm_size = self.no_single_states
+
         self.ps = self.__get_ps()
         self.concatenated_ps = ConcatenatedPTable(self.ps, PROJECTIONS)
-
         jbs = JointProbTable(self.concatenated_ps, PROJECTIONS)
-        self.joint_matrix = numpy.array(
-            [[jbs[l, r] for r in xrange(self.no_ancestral_states)] for l in xrange(self.no_ancestral_states)])
 
-        super(IsolationHMM, self).__init__(
-            self.joint_matrix,
-            list(self.sin_breaks),
-            self.coal_rate)
+        self.joint_matrix = numpy.array(
+            [[jbs[l, r] for r in xrange(self.hmm_size)] for l in xrange(self.hmm_size)])
+
+        super(SingleHMM, self).__init__(self.joint_matrix, list(self.sin_breaks), self.c)
 
     def __get_ps(self):
         """
         Return the list of probabilities for each time slice
         :return: the list of probabilities for each time slice
         """
-        to_return = [expm(self.q_iso * self.sin_breaks[0])]
+        to_return = [numpy.identity(self.q_sin.shape[0])]
         to_return.extend([expm(self.q_sin * (self.sin_breaks[i + 1] - self.sin_breaks[i]))
                          for i in
                          xrange(len(self.sin_breaks) - 1)])
@@ -55,11 +55,10 @@ def main():
     """
     Test main
     """
-    model = IsolationHMM([0.002, 2000.0, 0.8], 3)
+    model = SingleHMM([0.4, 0.2], 10)
     print model.emission_matrix
     print model.transition_matrix
     print model.initial_distribution
-
 
 if __name__ == '__main__':
     main()
