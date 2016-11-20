@@ -1,58 +1,111 @@
-from abc import ABCMeta, abstractmethod
-
 import glob
 import os
-import random
+import sys
 
-from IsolationHMM import IsolationHMM
-from IsolationInitialMigrationHMM import IsolationInitialMigrationHMM
+from abc import ABCMeta, abstractmethod
 from AdmixtureHMM import AdmixtureHMM
 from Admixture23HMM import Admixture23HMM
+from IsolationHMM import IsolationHMM
+from IsolationInitialMigrationHMM import IsolationInitialMigrationHMM
 from SingleAdmixtureHMM import SingleAdmixtureHMM
 from SingleHMM import SingleHMM
-from pyZipHMM import Forwarder, Matrix
+from ziphmm import HiddenMarkovModel, ZipDirectory, compute_lle
 
 COAL_MUL = 2.0
 NUM_STATES = 5
 
 
-def _to_pyziphmm_matrix(numpy_array):
-    """
-    Convert a numpy array to a ziphmm matrix
-    :param numpy_array: The numpy array
-    :return: The ziphmm matrix
-    """
-    ziphmm_matrix = Matrix(numpy_array.shape[0], numpy_array.shape[1])
-    for i in xrange(numpy_array.shape[0]):
-        for j in xrange(numpy_array.shape[1]):
-            ziphmm_matrix[i, j] = numpy_array[i, j]
-    return ziphmm_matrix
-
-
-def _compute_likelihood(model, forwarders):
+def _compute_likelihood(model, ziphmm_seqs):
     """
     Return the likelihood value for a given model and sequences
     :param model: An HMM model
-    :param forwarders: A list of ziphmm forwarder objects created from sequences
+    :param ziphmm_seqs: A list of compressed ZipHMM sequences
     :return: The likelihood value
     """
 
-    t = _to_pyziphmm_matrix(model.transition_matrix)
-    e = _to_pyziphmm_matrix(model.emission_matrix)
-    pi = _to_pyziphmm_matrix(model.initial_distribution)
+    state_count, alphabet_size = model.emission_matrix.shape
+    assert state_count > 0
+    assert alphabet_size > 0
+    assert (state_count, state_count) == model.transition_matrix.shape
+    assert (state_count, 1) == model.initial_distribution.shape
 
-    return sum(forwarder.forward(pi, t, e) for forwarder in forwarders)
+    hmm = HiddenMarkovModel(state_count, alphabet_size)
+
+    for i in xrange(state_count):
+        hmm.pi[i] = model.initial_distribution[i, 0]
+
+    for i in xrange(state_count):
+        for j in xrange(state_count):
+            hmm.a[i, j] = model.transition_matrix[i, j]
+
+    for i in xrange(state_count):
+        for j in xrange(alphabet_size):
+            hmm.b[i, j] = model.emission_matrix[i, j]
+
+    lle = 0.0
+    for x in ziphmm_seqs:
+        n = compute_lle(hmm, x)
+        if n is None:
+            raise ArithmeticError()
+        lle += n
+    return lle
 
 
-def _prepare_alignments(options, group_dir='ziphmm'):
-    """
-    Prepare alignments for the optimisation
-    :param options: The model and optimiser options
-    :param group_dir: The folder that contains the ziphmm sequence data
-    :return: A list of ziphmm forwarder objects created with the sequence data
-    """
-    folders = glob.glob(os.path.join(os.path.join(options.exp_folder, group_dir), '*.ziphmm*'))
-    return [random.choice(folders) for _ in xrange(len(folders))]
+def _get_ziphmm_root_dir(options, group_dir):
+    return os.path.join(
+        options.exp_folder,
+        'ziphmm_{0}_{1}'.format(options.model, group_dir))
+
+
+def _init_alignments(options, fasta_index1, fasta_index2, group_dir):
+    assert os.path.isdir(options.exp_folder), \
+        'Directory not found: {0}'.format(options.exp_folder)
+    assert len(options.fasta) > fasta_index1, \
+        'Not enough FASTA files specified'
+    assert len(options.fasta) > fasta_index2, \
+        'Not enough FASTA files specified'
+
+    root_dir = _get_ziphmm_root_dir(options, group_dir)
+
+    if not os.path.isdir(root_dir):
+        print '# Creating directory: {0}'.format(root_dir)
+        os.mkdir(root_dir)
+
+    ZipDirectory.create_original_sequences(
+        root_dir,
+        options.fasta[fasta_index1],
+        options.fasta[fasta_index2],
+        options.chunk_size,
+        sys.stdout)
+
+    ziphmm_dirs = map(ZipDirectory, glob.glob(os.path.join(root_dir, '*')))
+
+    for ziphmm_dir in ziphmm_dirs:
+        if not ziphmm_dir.is_cached(NUM_STATES):
+            print '# Creating {0}-state alignment in directory: {1}'.format(
+                NUM_STATES, ziphmm_dir.path)
+            ziphmm_dir.create_cache(NUM_STATES)
+
+
+def _load_alignments(options, group_dir):
+    assert os.path.isdir(options.exp_folder), \
+        'Directory not found: {0}'.format(options.exp_folder)
+
+    root_dir = _get_ziphmm_root_dir(options, group_dir)
+
+    assert os.path.isdir(root_dir), \
+        'Directory not found: {0}'.format(root_dir)
+
+    ziphmm_dirs = map(ZipDirectory, glob.glob(os.path.join(root_dir, '*')))
+
+    assert len(ziphmm_dirs) > 0, \
+        'No ZipHMM directories found in {0}'.format(root_dir)
+
+    for ziphmm_dir in ziphmm_dirs:
+        assert ziphmm_dir.is_cached(NUM_STATES), \
+            'Directory not initialized: {0}'.format(ziphmm_dir.path)
+
+    return [ziphmm_dir.load(NUM_STATES) for ziphmm_dir in ziphmm_dirs]
 
 
 class Model(object):
@@ -65,227 +118,452 @@ class Model(object):
     def likelihood(self, parameters):
         """
         Compute and return a valid likelihood for the given set of parameters.
-        If any arithmetic errors occur, return negative infinity.
+        If any arithmetic errors occur or if any parameter is not positive,
+        return negative infinity.
         :param parameters: The parameters to evaluate
         :return: The likelihood values evaluated with the given parameters
         """
+        if any(e <= 0.0 for e in parameters):
+            return float('-inf')
         try:
             return self.raw_likelihood(parameters)
         except ArithmeticError:
             return float('-inf')
 
+    @property
+    def fasta_count(self):
+        pass
+
+    @property
+    def param_count(self):
+        pass
+
+    @abstractmethod
+    def init_alignments(self):
+        """
+        Initialize the alignments of the model.
+        :return: None
+        """
+        pass
+
+    @abstractmethod
+    def load_alignments(self):
+        """
+        Load the alignments of the model.
+        :return: None
+        """
+        pass
+
     @abstractmethod
     def raw_likelihood(self, parameters):
         """
-        Compute and return a valid likelihood for a given set of parameters.
-        If any errors occur, throw an exception.
+        Compute and return a valid likelihood for the given set of parameters.
+        If any arithmetic errors occur, raise an exception.
         :param parameters: The parameters to evaluate
         :return: The likelihood values evaluated with the given parameters
         """
         pass
 
 
-class _IsolationModel(Model):
+class _StandardModel(Model):
+    """
+    An abstract base class for models that compute likelihoods by summing the
+    likelihoods computed for pairs of HMMs and zipped sequences.
+    """
+    __metaclass__ = ABCMeta
+
+    def __init__(self, options, param_count):
+        """
+        Initialize a new instance of the class based on the specified options.
+        The options must provide at least the experiments folder (exp_folder)
+        and the list of fasta files (fasta) if the init_alignments folder is
+        ever executed.
+
+        :param options: The program options.
+        """
+        super(_StandardModel, self).__init__()
+
+        self.__options = options
+        self.__groups = []
+        self.__alignments = []
+        self.__lle = 0.0
+        self.__index = 0
+        self.__param_count = param_count
+
+    @property
+    def fasta_count(self):
+        n = 0
+        for f1, f2, _ in self.__groups:
+            n = max([n, f1, f2])
+        return n + 1
+
+    @property
+    def param_count(self):
+        return self.__param_count
+
+    def init_alignments(self):
+        for fasta_index_1, fasta_index_2, group_name in self.__groups:
+            _init_alignments(
+                self.__options,
+                fasta_index_1,
+                fasta_index_2,
+                group_name)
+
+    def load_alignments(self):
+        for _, _, group_name in self.__groups:
+            alignments = _load_alignments(self.__options, group_name)
+            self.__alignments.append(alignments)
+
+    def add_group(self, fasta_index_1, fasta_index_2, group_name):
+        """
+        Add a group definition, consisting of a group name and the indices for
+        two FASTA files. Each index corresponds to a list index in the fasta
+        property of the options passed to the initializer. The group name
+        corresponds to the name of the directory to create in the experiments
+        folder, which is also specified through the options as the exp_folder
+        property.
+
+        :param fasta_index_1: The index of the first FASTA file.
+        :param fasta_index_2: The index of the second FASTA file.
+        :param group_name: The name of the group folder.
+        :return: None
+        """
+        assert fasta_index_1 != fasta_index_2
+        self.__groups.append((fasta_index_1, fasta_index_2, group_name))
+
+    def begin_calculation(self):
+        """
+        Begin a new calculation; this method must be called before executing
+        the calculate and end_calculation methods.
+        :return:
+        """
+        self.__lle = 0.0
+        self.__index = 0
+
+    def calculate(self, model):
+        """
+        Calculate the likelihood for the specified model based on the next
+        available alignment set; add the likelihood to a running total that
+        will be returned by the end_calculation method.
+
+        :param model: The model used to compute the likelihood.
+        :return: None
+        """
+        assert self.__index < len(self.__alignments)
+        alignments = self.__alignments[self.__index]
+        self.__lle += _compute_likelihood(model, alignments)
+        self.__index += 1
+
+    def end_calculation(self):
+        """
+        End the calculation of the likelihood and return the corresponding
+        sum. This method may be called only when all alignments have
+        contributed to the likelihood calculation.
+
+        :return: The sum of the likelihoods.
+        """
+        assert self.__index == len(self.__alignments)
+        return self.__lle
+
+
+class _IsolationModel(_StandardModel):
     """
     This class sets up an isolation model, AB.
     """
 
     def __init__(self, options):
-        super(_IsolationModel, self).__init__()
-        alignments = _prepare_alignments(options, 'ziphmm_src1_admix')
-        self.forwarders = [Forwarder.fromDirectory(arg) for arg in alignments]
+        super(_IsolationModel, self).__init__(options, 3)
+
+        a, b = range(2)
+        self.add_group(a, b, 'a_b')
 
     def raw_likelihood(self, parameters):
-        assert len(parameters) == 3
-        model = IsolationHMM(parameters, NUM_STATES)
-        return _compute_likelihood(model, self.forwarders)
-
-
-class _Isolation3HMMModel(Model):
-    """
-    This class sets up an isolation model of 3 HMMs, AA, BB, and AB, using the
-    composite likelihood method
-    """
-
-    def __init__(self, options):
-        super(_Isolation3HMMModel, self).__init__()
-
-        alignments_src1_admix = _prepare_alignments(options, 'ziphmm_src1_admix')
-        alignments_src1_scr1 = _prepare_alignments(options, 'ziphmm_scr1_scr1')
-        alignments_admix_admix = _prepare_alignments(options, 'ziphmm_admix_admix')
-        self.forwarders_src1_admix = [Forwarder.fromDirectory(arg) for arg in alignments_src1_admix]
-        self.forwarders_src1_src1 = [Forwarder.fromDirectory(arg) for arg in alignments_src1_scr1]
-        self.forwarders_admix_admix = [Forwarder.fromDirectory(arg) for arg in alignments_admix_admix]
-
-    def raw_likelihood(self, parameters):
+        #
+        # parameters ->
+        #   [0] tau
+        #   [1] coal_rate
+        #   [2] recomb_rate
+        #
         assert len(parameters) == 3
 
-        coal_rate = parameters[1]
-        recomb_rate = parameters[2]
+        self.begin_calculation()
 
-        s_a = IsolationHMM(parameters, NUM_STATES)
-        s_s = SingleHMM([COAL_MUL * coal_rate, recomb_rate], NUM_STATES)
-        a_a = SingleHMM([COAL_MUL * coal_rate, recomb_rate], NUM_STATES)
+        self.calculate(IsolationHMM(
+            parameters,
+            NUM_STATES))
 
-        lle_s_a = _compute_likelihood(s_a, self.forwarders_src1_admix)
-        lle_s_s = _compute_likelihood(s_s, self.forwarders_src1_src1)
-        lle_a_a = _compute_likelihood(a_a, self.forwarders_admix_admix)
-        return lle_s_a + lle_s_s + lle_a_a
+        return self.end_calculation()
 
 
-class _IsolationInitialMigrationModel(Model):
+class _IsolationInitialMigrationModel(_StandardModel):
     """
     This class sets up an isolation with initial migration model, AB.
     """
 
     def __init__(self, options):
-        super(_IsolationInitialMigrationModel, self).__init__()
+        super(_IsolationInitialMigrationModel, self).__init__(options, 5)
 
-        alignments = _prepare_alignments(options, 'ziphmm_src1_admix')
-
-        self.forwarders = [Forwarder.fromDirectory(arg) for arg in alignments]
+        a, b = range(2)
+        self.add_group(a, b, 'a_b')
 
     def raw_likelihood(self, parameters):
+        #
+        # parameters ->
+        #   [0] iso_time
+        #   [1] mig_time
+        #   [2] coal_rate
+        #   [3] recomb_rate
+        #   [4] mig_rate
+        #
         assert len(parameters) == 5
-        model = IsolationInitialMigrationHMM(parameters, NUM_STATES, NUM_STATES)
-        return _compute_likelihood(model, self.forwarders)
+
+        self.begin_calculation()
+
+        self.calculate(IsolationInitialMigrationHMM(
+            parameters,
+            NUM_STATES,
+            NUM_STATES))
+
+        return self.end_calculation()
 
 
-class _IsolationInitialMigration3HMMModel(Model):
+class _Isolation3HMMModel(_StandardModel):
+    """
+    This class sets up an isolation model of 3 HMMs, AB, AA, and BB, using the
+    composite likelihood method
+    """
+
+    def __init__(self, options):
+        super(_Isolation3HMMModel, self).__init__(options, 3)
+
+        a1, a2, b1, b2 = range(4)
+        self.add_group(a1, b1, 'a1_b1')
+        self.add_group(a1, a2, 'a1_a2')
+        self.add_group(b1, b2, 'b1_b2')
+    
+    def raw_likelihood(self, parameters):
+        #
+        # parameters ->
+        #   [0] tau
+        #   [1] coal_rate
+        #   [2] recomb_rate
+        #
+        assert len(parameters) == 3
+
+        coal_rate = parameters[1]
+        recomb_rate = parameters[2]
+
+        self.begin_calculation()
+
+        self.calculate(IsolationHMM(
+            parameters,
+            NUM_STATES))
+
+        self.calculate(SingleHMM(
+            [COAL_MUL * coal_rate, recomb_rate],
+            NUM_STATES))
+
+        self.calculate(SingleHMM(
+            [COAL_MUL * coal_rate, recomb_rate],
+            NUM_STATES))
+
+        return self.end_calculation()
+
+
+class _IsolationInitialMigration3HMMModel(_StandardModel):
     """
     This class sets up an isolation with initial migration model of 3 HMMs, AA,
     BB, and AB, using the composite likelihood method
     """
 
     def __init__(self, options):
-        super(_IsolationInitialMigration3HMMModel, self).__init__()
+        super(_IsolationInitialMigration3HMMModel, self).__init__(options, 5)
 
-        alignments_src1_admix = _prepare_alignments(options, 'ziphmm_src1_admix')
-        alignments_src1_scr1 = _prepare_alignments(options, 'ziphmm_scr1_scr1')
-        alignments_admix_admix = _prepare_alignments(options, 'ziphmm_admix_admix')
-        self.forwarders_src1_admix = [Forwarder.fromDirectory(arg) for arg in alignments_src1_admix]
-        self.forwarders_src1_src1 = [Forwarder.fromDirectory(arg) for arg in alignments_src1_scr1]
-        self.forwarders_admix_admix = [Forwarder.fromDirectory(arg) for arg in alignments_admix_admix]
+        a1, a2, b1, b2 = range(4)
+        self.add_group(a1, b1, 'a1_b1')
+        self.add_group(a1, a2, 'a1_a2')
+        self.add_group(b1, b2, 'b1_b2')
 
     def raw_likelihood(self, parameters):
+        #
+        # parameters ->
+        #   [0] iso_time
+        #   [1] mig_time
+        #   [2] coal_rate
+        #   [3] recomb_rate
+        #   [4] mig_rate
+        #
         assert len(parameters) == 5
 
         coal_rate = parameters[2]
         recomb_rate = parameters[3]
 
-        s_a = IsolationInitialMigrationHMM(parameters, NUM_STATES, NUM_STATES)
-        s_s = SingleHMM([COAL_MUL * coal_rate, recomb_rate], NUM_STATES)
-        a_a = SingleHMM([COAL_MUL * coal_rate, recomb_rate], NUM_STATES)
+        self.begin_calculation()
 
-        lle_s_a = _compute_likelihood(s_a, self.forwarders_src1_admix)
-        lle_s_s = _compute_likelihood(s_s, self.forwarders_src1_src1)
-        lle_a_a = _compute_likelihood(a_a, self.forwarders_admix_admix)
-        return lle_s_a + lle_s_s + lle_a_a
+        self.calculate(IsolationInitialMigrationHMM(
+            parameters,
+            NUM_STATES,
+            NUM_STATES))
+
+        self.calculate(SingleHMM(
+            [COAL_MUL * coal_rate, recomb_rate],
+            NUM_STATES))
+
+        self.calculate(SingleHMM(
+            [COAL_MUL * coal_rate, recomb_rate],
+            NUM_STATES))
+
+        return self.end_calculation()
 
 
-class _ThreePopAdmixModel(Model):
+class _ThreePopAdmixModel(_StandardModel):
     """
     This class sets up a simple admixture model of 3 HMMs, AC, BC, and AB using
     the composite likelihood method
     """
 
     def __init__(self, options):
-        super(_ThreePopAdmixModel, self).__init__()
+        super(_ThreePopAdmixModel, self).__init__(options, 5)
 
-        alignments_src1_admix = _prepare_alignments(options, 'ziphmm_src1_admix')
-        alignments_src2_admix = _prepare_alignments(options, 'ziphmm_src2_admix')
-        alignments_src1_src2 = _prepare_alignments(options, 'ziphmm_src1_src2')
-
-        self.forwarders_src1_admix = [Forwarder.fromDirectory(arg) for arg in alignments_src1_admix]
-        self.forwarders_src2_admix = [Forwarder.fromDirectory(arg) for arg in alignments_src2_admix]
-        self.forwarders_src1_src2 = [Forwarder.fromDirectory(arg) for arg in alignments_src1_src2]
+        a, b, c = range(3)
+        self.add_group(a, c, 'a_c')
+        self.add_group(b, c, 'b_c')
+        self.add_group(a, b, 'a_b')
 
     def raw_likelihood(self, parameters):
+        #
+        # parameters ->
+        #   [0] iso_time
+        #   [1] mig_time
+        #   [2] coal_rate
+        #   [3] recomb_rate
+        #   [4] admix_prop
+        #
         assert len(parameters) == 5
-        if parameters[-1] > 1:
+
+        iso_time, mig_time, coal_rate, recomb_rate, admix_prop = parameters
+        tau = iso_time + mig_time
+
+        if admix_prop > 1:
             return float('-inf')
 
-        src1_admix = AdmixtureHMM([parameters[0], parameters[1], parameters[2], parameters[3], 0, parameters[-1]], NUM_STATES, NUM_STATES)
-        src2_admix = AdmixtureHMM([parameters[0], parameters[1], parameters[2], parameters[3], 1 - parameters[-1], 0], NUM_STATES, NUM_STATES)
-        src1_src2 = IsolationHMM([parameters[0] + parameters[1], parameters[2], parameters[3]], NUM_STATES)
+        self.begin_calculation()
 
-        lle1 = _compute_likelihood(src1_admix, self.forwarders_src1_admix)
-        lle2 = _compute_likelihood(src2_admix, self.forwarders_src2_admix)
-        lle3 = _compute_likelihood(src1_src2, self.forwarders_src1_src2)
-        return lle1 + lle2 + lle3
+        self.calculate(AdmixtureHMM(
+            [iso_time, mig_time, coal_rate, recomb_rate, 0.0, admix_prop],
+            NUM_STATES,
+            NUM_STATES))
+
+        self.calculate(AdmixtureHMM(
+            [iso_time, mig_time, coal_rate, recomb_rate, 1.0 - admix_prop, 0.0],
+            NUM_STATES,
+            NUM_STATES))
+
+        self.calculate(IsolationHMM(
+            [tau, coal_rate, recomb_rate],
+            NUM_STATES))
+
+        return self.end_calculation()
 
 
-class _ThreePopAdmix23Model(Model):
+class _ThreePopAdmix23Model(_StandardModel):
     """
     This class sets up a general admixture model of 3 HMMs, AC, BC, and AB using
     the composite likelihood method
     """
 
     def __init__(self, options):
-        super(_ThreePopAdmix23Model, self).__init__()
+        super(_ThreePopAdmix23Model, self).__init__(options, 7)
 
-        alignments_src1_admix = _prepare_alignments(options, 'ziphmm_src1_admix')
-        alignments_src2_admix = _prepare_alignments(options, 'ziphmm_src2_admix')
-        alignments_src1_src2 = _prepare_alignments(options, 'ziphmm_src1_src2')
-
-        self.forwarders_src1_admix = [Forwarder.fromDirectory(arg) for arg in alignments_src1_admix]
-        self.forwarders_src2_admix = [Forwarder.fromDirectory(arg) for arg in alignments_src2_admix]
-        self.forwarders_src1_src2 = [Forwarder.fromDirectory(arg) for arg in alignments_src1_src2]
+        a, b, c = range(3)
+        self.add_group(a, c, 'a_c')
+        self.add_group(b, c, 'b_c')
+        self.add_group(a, b, 'a_b')
 
     def raw_likelihood(self, parameters):
+        #
+        # parameters ->
+        #   [0] iso_time
+        #   [1] buddy23_time_1a
+        #   [2] buddy23_time_2a
+        #   [3] greedy1_time_1a
+        #   [4] coal_rate
+        #   [5] recomb_rate
+        #   [6] admix_prop
+        #
         assert len(parameters) == 7
 
-        ts_r = parameters[3] + parameters[1] - parameters[2]
-        if ts_r <= 0:
+        iso_time, buddy23_time_1a, buddy23_time_2a, greedy1_time_1a,\
+            coal_rate, recomb_rate, admix_prop = parameters
+
+        tau = iso_time + buddy23_time_1a + greedy1_time_1a
+        greedy1_time_2a = greedy1_time_1a + buddy23_time_1a - buddy23_time_2a
+
+        if greedy1_time_2a <= 0:
             return float('-inf')
-        if parameters[6] < 0.0 or parameters[6] > 1.0:
+
+        if admix_prop < 0.0 or admix_prop > 1.0:
             return float('-inf')
 
-        s1_a = Admixture23HMM([parameters[0], parameters[1], parameters[3],
-                               parameters[4], parameters[5], parameters[6]], NUM_STATES, NUM_STATES)
+        self.begin_calculation()
 
-        s2_a = Admixture23HMM([parameters[0], parameters[2], ts_r,
-                               parameters[4], parameters[5], 1 - parameters[6]], NUM_STATES, NUM_STATES)
+        self.calculate(Admixture23HMM(
+            [iso_time, buddy23_time_1a, greedy1_time_1a, coal_rate, recomb_rate, admix_prop],
+            NUM_STATES,
+            NUM_STATES))
 
-        tau = parameters[0] + parameters[1] + parameters[3]
+        self.calculate(Admixture23HMM(
+            [iso_time, buddy23_time_2a, greedy1_time_2a, coal_rate, recomb_rate, 1.0 - admix_prop],
+            NUM_STATES,
+            NUM_STATES))
 
-        s1_s2 = IsolationHMM([tau, parameters[4], parameters[5]], NUM_STATES)
+        self.calculate(IsolationHMM(
+            [tau, coal_rate, recomb_rate],
+            NUM_STATES))
 
-        lle1 = _compute_likelihood(s1_a, self.forwarders_src1_admix)
-        lle2 = _compute_likelihood(s2_a, self.forwarders_src2_admix)
-        lle3 = _compute_likelihood(s1_s2, self.forwarders_src1_src2)
-        return lle1 + lle2 + lle3
+        return self.end_calculation()
 
 
-class _OnePopAdmix23Model(Model):
+class _OnePopAdmix23Model(_StandardModel):
     """
     This class sets up a general admixture model with only the admixed
     population, CC.
     """
 
     def __init__(self, options):
-        super(_OnePopAdmix23Model, self).__init__()
+        super(_OnePopAdmix23Model, self).__init__(options, 5)
 
-        alignments_admix_admix = _prepare_alignments(options, 'ziphmm_admix_admix')
-        self.forwarders_admix_admix = [Forwarder.fromDirectory(arg) for arg in alignments_admix_admix]
+        c1, c2 = range(2)
+        self.add_group(c1, c2, 'c1_c2')
 
     def raw_likelihood(self, parameters):
+        #
+        # parameters ->
+        #   [0] iso_time
+        #   [1] mig_time
+        #   [2] coal_rate
+        #   [3] recomb_rate
+        #   [4] admix_prop
+        #
         assert len(parameters) == 5
 
-        iso_time = parameters[0]
-        mig_time = parameters[1]
-        coal_rate = parameters[2]
-        recomb_rate = parameters[3]
-        admix_prop = parameters[4]
+        iso_time, mig_time, coal_rate, recomb_rate, admix_prop = parameters
+
         if admix_prop < 0.0 or admix_prop > 1.0:
             return float('-inf')
 
-        a_a = SingleAdmixtureHMM([iso_time, mig_time, COAL_MUL * coal_rate, recomb_rate, admix_prop], NUM_STATES, NUM_STATES, NUM_STATES)
+        self.begin_calculation()
 
-        return _compute_likelihood(a_a, self.forwarders_admix_admix)
+        self.calculate(SingleAdmixtureHMM(
+            [iso_time, mig_time, COAL_MUL * coal_rate, recomb_rate, admix_prop],
+            NUM_STATES,
+            NUM_STATES,
+            NUM_STATES))
+
+        return self.end_calculation()
 
 
-class _TwoPopAdmix23Model(Model):
+class _TwoPopAdmix23Model(_StandardModel):
     """
     This class sets up a general admixture model with only the admixed
     population and one of the two source populations, AC, AA, and CC, using the
@@ -293,217 +571,290 @@ class _TwoPopAdmix23Model(Model):
     """
 
     def __init__(self, options):
-        super(_TwoPopAdmix23Model, self).__init__()
+        super(_TwoPopAdmix23Model, self).__init__(options, 6)
 
-        alignments_src1_admix = _prepare_alignments(options, 'ziphmm_src1_admix')
-        alignments_src1_scr1 = _prepare_alignments(options, 'ziphmm_scr1_scr1')
-        alignments_admix_admix = _prepare_alignments(options, 'ziphmm_admix_admix')
-
-        self.forwarders_src1_admix = [Forwarder.fromDirectory(arg) for arg in alignments_src1_admix]
-        self.forwarders_src1_src1 = [Forwarder.fromDirectory(arg) for arg in alignments_src1_scr1]
-        self.forwarders_admix_admix = [Forwarder.fromDirectory(arg) for arg in alignments_admix_admix]
+        a1, a2, c1, c2 = range(4)
+        self.add_group(a1, c1, 'a1_c1')
+        self.add_group(a1, a2, 'a1_a2')
+        self.add_group(c1, c2, 'c1_c2')
 
     def raw_likelihood(self, parameters):
+        #
+        # parameters ->
+        #   [0] iso_time
+        #   [1] buddy23_time
+        #   [2] greedy1_time
+        #   [3] coal_rate
+        #   [4] recomb_rate
+        #   [5] admix_prop
+        #
         assert len(parameters) == 6
 
-        iso_time = parameters[0]
-        mig_time = parameters[1] + parameters[2]
-        coal_rate = parameters[3]
-        recomb_rate = parameters[4]
-        admix_prop = parameters[5]
+        iso_time, buddy23_time, greedy1_time,\
+            coal_rate, recomb_rate, admix_prop = parameters
+
+        mig_time = buddy23_time + greedy1_time
+
         if admix_prop < 0.0 or admix_prop > 1.0:
             return float('-inf')
 
-        s1_a = Admixture23HMM([iso_time, parameters[1], parameters[2], coal_rate, recomb_rate, admix_prop], NUM_STATES, NUM_STATES)
+        self.begin_calculation()
 
-        s1_s1 = SingleHMM([COAL_MUL * coal_rate, recomb_rate], NUM_STATES)
-        a_a = SingleAdmixtureHMM([iso_time, mig_time, COAL_MUL * coal_rate, recomb_rate, admix_prop], NUM_STATES, NUM_STATES, NUM_STATES)
+        self.calculate(Admixture23HMM(
+            [iso_time, buddy23_time, greedy1_time, coal_rate, recomb_rate, admix_prop],
+            NUM_STATES,
+            NUM_STATES))
 
-        lle_s_a = _compute_likelihood(s1_a, self.forwarders_src1_admix)
-        lle_s_s = _compute_likelihood(s1_s1, self.forwarders_src1_src1)
-        lle_a_a = _compute_likelihood(a_a, self.forwarders_admix_admix)
-        return lle_s_a + lle_s_s + lle_a_a
+        self.calculate(SingleHMM(
+            [COAL_MUL * coal_rate, recomb_rate],
+            NUM_STATES))
+
+        self.calculate(SingleAdmixtureHMM(
+            [iso_time, mig_time, COAL_MUL * coal_rate, recomb_rate, admix_prop],
+            NUM_STATES,
+            NUM_STATES,
+            NUM_STATES))
+
+        return self.end_calculation()
 
 
-class _TwoPopAdmix23OneSampleModel(Model):
+class _TwoPopAdmix23OneSampleModel(_StandardModel):
     """
     This class sets up a general admixture model with only the admixed
     population and one of the two source populations, AC.
     """
 
     def __init__(self, options):
-        super(_TwoPopAdmix23OneSampleModel, self).__init__()
+        super(_TwoPopAdmix23OneSampleModel, self).__init__(options, 6)
 
-        alignments_src1_admix = _prepare_alignments(options, 'ziphmm_src1_admix')
-        self.forwarders_src1_admix = [Forwarder.fromDirectory(arg) for arg in alignments_src1_admix]
+        a, c = range(2)
+        self.add_group(a, c, 'a_c')
 
     def raw_likelihood(self, parameters):
+        #
+        # parameters ->
+        #   [0] iso_time
+        #   [1] buddy23_time
+        #   [2] greedy1_time
+        #   [3] coal_rate
+        #   [4] recomb_rate
+        #   [5] admix_prop
+        #
         assert len(parameters) == 6
 
         admix_prop = parameters[5]
+
         if admix_prop < 0.0 or admix_prop > 1.0:
             return float('-inf')
 
-        s1_a = Admixture23HMM(parameters, NUM_STATES, NUM_STATES)
+        self.begin_calculation()
 
-        return _compute_likelihood(s1_a, self.forwarders_src1_admix)
+        self.calculate(Admixture23HMM(
+            parameters,
+            NUM_STATES,
+            NUM_STATES))
+
+        return self.end_calculation()
 
 
-class _ThreePopAdmix23Model6HMM(Model):
+class _ThreePopAdmix23Model6HMM(_StandardModel):
     """
     This class sets up a general admixture model, AC, BC, AB, AA, BB, and CC,
     using the composite likelihood method
     """
 
     def __init__(self, options):
-        super(_ThreePopAdmix23Model6HMM, self).__init__()
+        super(_ThreePopAdmix23Model6HMM, self).__init__(options, 7)
 
-        alignments_src1_admix = _prepare_alignments(options, 'ziphmm_src1_admix')
-        alignments_src2_admix = _prepare_alignments(options, 'ziphmm_src2_admix')
-        alignments_src1_src2 = _prepare_alignments(options, 'ziphmm_src1_src2')
-        alignments_src1_scr1 = _prepare_alignments(options, 'ziphmm_scr1_scr1')
-        alignments_src2_src2 = _prepare_alignments(options, 'ziphmm_src2_src2')
-        alignments_admix_admix = _prepare_alignments(options, 'ziphmm_admix_admix')
-
-        self.forwarders_src1_admix = [Forwarder.fromDirectory(arg) for arg in alignments_src1_admix]
-        self.forwarders_src2_admix = [Forwarder.fromDirectory(arg) for arg in alignments_src2_admix]
-        self.forwarders_src1_src2 = [Forwarder.fromDirectory(arg) for arg in alignments_src1_src2]
-        self.forwarders_src1_src1 = [Forwarder.fromDirectory(arg) for arg in alignments_src1_scr1]
-        self.forwarders_src2_src2 = [Forwarder.fromDirectory(arg) for arg in alignments_src2_src2]
-        self.forwarders_admix_admix = [Forwarder.fromDirectory(arg) for arg in alignments_admix_admix]
+        a1, a2, b1, b2, c1, c2 = range(6)
+        self.add_group(a1, c1, 'a1_c1')
+        self.add_group(b1, c1, 'b1_c1')
+        self.add_group(a1, b1, 'a1_b1')
+        self.add_group(a1, a2, 'a1_a2')
+        self.add_group(b1, b2, 'b1_b2')
+        self.add_group(c1, c2, 'c1_c2')
 
     def raw_likelihood(self, parameters):
+        #
+        # parameters ->
+        #   [0] iso_time
+        #   [1] buddy23_time_1a
+        #   [2] buddy23_time_2a
+        #   [3] greedy1_time_1a
+        #   [4] coal_rate
+        #   [5] recomb_rate
+        #   [6] admix_prop
+        #
         assert len(parameters) == 7
 
-        iso_time = parameters[0]
-        mig_time = parameters[3] + parameters[1]
-        ts_r = mig_time - parameters[2]
+        iso_time, buddy23_time_1a, buddy23_time_2a, greedy1_time_1a,\
+            coal_rate, recomb_rate, admix_prop = parameters
+
+        mig_time = greedy1_time_1a + buddy23_time_1a
+        greedy1_time_2a = mig_time - buddy23_time_2a
         tau = iso_time + mig_time
-        coal_rate = parameters[4]
-        recomb_rate = parameters[5]
-        admix_prop = parameters[6]
-        if ts_r <= 0:
+
+        if greedy1_time_2a <= 0:
             return float('-inf')
+
         if admix_prop < 0.0 or admix_prop > 1.0:
             return float('-inf')
 
-        s1_a = Admixture23HMM([iso_time, parameters[1], parameters[3], coal_rate, recomb_rate, admix_prop], NUM_STATES, NUM_STATES)
-        s2_a = Admixture23HMM([iso_time, parameters[2], ts_r, coal_rate, recomb_rate, 1.0 - admix_prop], NUM_STATES, NUM_STATES)
-        s1_s2 = IsolationHMM([tau, coal_rate, recomb_rate], NUM_STATES)
+        self.begin_calculation()
 
-        s1_s1 = SingleHMM([COAL_MUL * coal_rate, recomb_rate], NUM_STATES)
-        s2_s2 = SingleHMM([COAL_MUL * coal_rate, recomb_rate], NUM_STATES)
-        a_a = SingleAdmixtureHMM([iso_time, mig_time, COAL_MUL * coal_rate, recomb_rate, admix_prop], NUM_STATES, NUM_STATES, NUM_STATES)
+        self.calculate(Admixture23HMM(
+            [iso_time, buddy23_time_1a, greedy1_time_1a, coal_rate, recomb_rate, admix_prop],
+            NUM_STATES,
+            NUM_STATES))
 
-        lle1 = _compute_likelihood(s1_a, self.forwarders_src1_admix)
-        lle2 = _compute_likelihood(s2_a, self.forwarders_src2_admix)
-        lle3 = _compute_likelihood(s1_s2, self.forwarders_src1_src2)
-        lle4 = _compute_likelihood(s1_s1, self.forwarders_src1_src1)
-        lle5 = _compute_likelihood(s2_s2, self.forwarders_src2_src2)
-        lle6 = _compute_likelihood(a_a, self.forwarders_admix_admix)
-        return lle1 + lle2 + lle3 + lle4 + lle5 + lle6
+        self.calculate(Admixture23HMM(
+            [iso_time, buddy23_time_2a, greedy1_time_2a, coal_rate, recomb_rate, 1.0 - admix_prop],
+            NUM_STATES,
+            NUM_STATES))
+
+        self.calculate(IsolationHMM(
+            [tau, coal_rate, recomb_rate],
+            NUM_STATES))
+
+        self.calculate(SingleHMM(
+            [COAL_MUL * coal_rate, recomb_rate],
+            NUM_STATES))
+
+        self.calculate(SingleHMM(
+            [COAL_MUL * coal_rate, recomb_rate],
+            NUM_STATES))
+
+        self.calculate(SingleAdmixtureHMM(
+            [iso_time, mig_time, COAL_MUL * coal_rate, recomb_rate, admix_prop],
+            NUM_STATES,
+            NUM_STATES,
+            NUM_STATES))
+
+        return self.end_calculation()
 
 
-class _ThreePopAdmix23Model15HMM(Model):
+class _ThreePopAdmix23Model15HMM(_StandardModel):
     """
-    This class sets up a general admixture model, A1C1, A1C2, A2C1, A2C2, B1C1,
-    B1C2, B2C1, B2C2, A1B1, A1B2, A2B1, A2B2, A1A2, B1B2, and C1C2, using the
-    composite likelihood method
+    This class sets up a general admixture model, A1C1, A1C2, A2C1, A2C2,
+    B1C1, B1C2, B2C1, B2C2, A1B1, A1B2, A2B1, A2B2, A1A2, B1B2, and C1C2,
+    using the composite likelihood method
     """
 
     def __init__(self, options):
-        super(_ThreePopAdmix23Model15HMM, self).__init__()
+        super(_ThreePopAdmix23Model15HMM, self).__init__(options, 7)
 
-        alignments_src1_admix = [_prepare_alignments(options, 'ziphmm_src1_admix'),
-                                 _prepare_alignments(options, 'ziphmm_src1_admix_2'),
-                                 _prepare_alignments(options, 'ziphmm_src1_admix_3'),
-                                 _prepare_alignments(options, 'ziphmm_src1_admix_4')]
-        alignments_src2_admix = [_prepare_alignments(options, 'ziphmm_src2_admix'),
-                                 _prepare_alignments(options, 'ziphmm_src2_admix_2'),
-                                 _prepare_alignments(options, 'ziphmm_src2_admix_3'),
-                                 _prepare_alignments(options, 'ziphmm_src2_admix_4')]
-        alignments_src1_src2 = [_prepare_alignments(options, 'ziphmm_src1_src2'),
-                                _prepare_alignments(options, 'ziphmm_src1_src2_2'),
-                                _prepare_alignments(options, 'ziphmm_src1_src2_3'),
-                                _prepare_alignments(options, 'ziphmm_src1_src2_4')]
-        alignments_src1_scr1 = _prepare_alignments(options, 'ziphmm_scr1_scr1')
-        alignments_src2_src2 = _prepare_alignments(options, 'ziphmm_src2_src2')
-        alignments_admix_admix = _prepare_alignments(options, 'ziphmm_admix_admix')
+        a1, a2, b1, b2, c1, c2 = range(6)
 
-        self.forwarders_src1_admix = [[Forwarder.fromDirectory(arg) for arg in algs] for algs in alignments_src1_admix]
-        self.forwarders_src2_admix = [[Forwarder.fromDirectory(arg) for arg in algs] for algs in alignments_src2_admix]
-        self.forwarders_src1_src2 = [[Forwarder.fromDirectory(arg) for arg in algs] for algs in alignments_src1_src2]
-        self.forwarders_src1_src1 = [Forwarder.fromDirectory(arg) for arg in alignments_src1_scr1]
-        self.forwarders_src2_src2 = [Forwarder.fromDirectory(arg) for arg in alignments_src2_src2]
-        self.forwarders_admix_admix = [Forwarder.fromDirectory(arg) for arg in alignments_admix_admix]
+        self.add_group(a1, c1, 'a1_c1')
+        self.add_group(a1, c2, 'a1_c2')
+        self.add_group(a2, c1, 'a2_c1')
+        self.add_group(a2, c2, 'a2_c2')
+
+        self.add_group(b1, c1, 'b1_c1')
+        self.add_group(b1, c2, 'b1_c2')
+        self.add_group(b2, c1, 'b2_c1')
+        self.add_group(b2, c2, 'b2_c2')
+
+        self.add_group(a1, b1, 'a1_b1')
+        self.add_group(a1, b2, 'a1_b2')
+        self.add_group(a2, b1, 'a2_b1')
+        self.add_group(a2, b2, 'a2_b2')
+
+        self.add_group(a1, a2, 'a1_a2')
+        self.add_group(b1, b2, 'b1_b2')
+        self.add_group(c1, c2, 'c1_c2')
 
     def raw_likelihood(self, parameters):
+        #
+        # parameters ->
+        #   [0] iso_time
+        #   [1] buddy23_time_1a
+        #   [2] buddy23_time_2a
+        #   [3] greedy1_time_1a
+        #   [4] coal_rate
+        #   [5] recomb_rate
+        #   [6] admix_prop
+        #
         assert len(parameters) == 7
 
-        iso_time = parameters[0]
-        mig_time = parameters[3] + parameters[1]
-        ts_r = mig_time - parameters[2]
+        iso_time, buddy23_time_1a, buddy23_time_2a, greedy1_time_1a,\
+            coal_rate, recomb_rate, admix_prop = parameters
+
+        mig_time = greedy1_time_1a + buddy23_time_1a
+        greedy1_time_2a = mig_time - buddy23_time_2a
         tau = iso_time + mig_time
-        coal_rate = parameters[4]
-        recomb_rate = parameters[5]
-        admix_prop = parameters[6]
-        if ts_r <= 0:
+
+        if greedy1_time_2a <= 0:
             return float('-inf')
+
         if admix_prop < 0.0 or admix_prop > 1.0:
             return float('-inf')
 
-        s1_a = Admixture23HMM([iso_time, parameters[1], parameters[3], coal_rate, recomb_rate, admix_prop], NUM_STATES, NUM_STATES)
-        s2_a = Admixture23HMM([iso_time, parameters[2], ts_r, coal_rate, recomb_rate, 1.0 - admix_prop], NUM_STATES, NUM_STATES)
-        s1_s2 = IsolationHMM([tau, coal_rate, recomb_rate], NUM_STATES)
+        self.begin_calculation()
 
-        s1_s1 = SingleHMM([COAL_MUL * coal_rate, recomb_rate], NUM_STATES)
-        s2_s2 = SingleHMM([COAL_MUL * coal_rate, recomb_rate], NUM_STATES)
-        a_a = SingleAdmixtureHMM([iso_time, mig_time, COAL_MUL * coal_rate, recomb_rate, admix_prop], NUM_STATES, NUM_STATES, NUM_STATES)
+        hmm_a_c = Admixture23HMM(
+            [iso_time, buddy23_time_1a, greedy1_time_1a, coal_rate, recomb_rate, admix_prop],
+            NUM_STATES,
+            NUM_STATES)
 
-        lle_s1_a = [_compute_likelihood(s1_a, forwarders) for forwarders in self.forwarders_src1_admix]
-        lle_s2_a = [_compute_likelihood(s2_a, forwarders) for forwarders in self.forwarders_src2_admix]
-        lle_s1_s2 = [_compute_likelihood(s1_s2, forwarders) for forwarders in self.forwarders_src1_src2]
-        lle_s1_s1 = [_compute_likelihood(s1_s1, self.forwarders_src1_src1)]
-        lle_s2_s2 = [_compute_likelihood(s2_s2, self.forwarders_src2_src2)]
-        lle_a_a = [_compute_likelihood(a_a, self.forwarders_admix_admix)]
-        return sum(lle_s1_a) + sum(lle_s2_a) + sum(lle_s1_s2) + sum(lle_s1_s1) + sum(lle_s2_s2) + sum(lle_a_a)
+        self.calculate(hmm_a_c)
+        self.calculate(hmm_a_c)
+        self.calculate(hmm_a_c)
+        self.calculate(hmm_a_c)
+
+        hmm_b_c = Admixture23HMM(
+            [iso_time, buddy23_time_2a, greedy1_time_2a, coal_rate, recomb_rate, 1.0 - admix_prop],
+            NUM_STATES,
+            NUM_STATES)
+
+        self.calculate(hmm_b_c)
+        self.calculate(hmm_b_c)
+        self.calculate(hmm_b_c)
+        self.calculate(hmm_b_c)
+
+        hmm_a_b = IsolationHMM(
+            [tau, coal_rate, recomb_rate],
+            NUM_STATES)
+
+        self.calculate(hmm_a_b)
+        self.calculate(hmm_a_b)
+        self.calculate(hmm_a_b)
+        self.calculate(hmm_a_b)
+
+        self.calculate(SingleHMM(
+            [COAL_MUL * coal_rate, recomb_rate],
+            NUM_STATES))
+
+        self.calculate(SingleHMM(
+            [COAL_MUL * coal_rate, recomb_rate],
+            NUM_STATES))
+
+        self.calculate(SingleAdmixtureHMM(
+            [iso_time, mig_time, COAL_MUL * coal_rate, recomb_rate, admix_prop],
+            NUM_STATES,
+            NUM_STATES,
+            NUM_STATES))
+
+        return self.end_calculation()
 
 
 def create(options):
-    if options.model == 'iso':
-        return _IsolationModel(options)
 
-    if options.model == 'iim':
-        return _IsolationInitialMigrationModel(options)
+    table = {
+        'iso':                  _IsolationModel,
+        'iim':                  _IsolationInitialMigrationModel,
+        'iso-3hmm':             _Isolation3HMMModel,
+        'iim-3hmm':             _IsolationInitialMigration3HMMModel,
+        'admix':                _ThreePopAdmixModel,
+        'admix23-1pop':         _OnePopAdmix23Model,
+        'admix23-2pop':         _TwoPopAdmix23Model,
+        'admix23-2pop-1sample': _TwoPopAdmix23OneSampleModel,
+        'admix23':              _ThreePopAdmix23Model,
+        'admix23-6hmm':         _ThreePopAdmix23Model6HMM,
+        'admix23-15hmm':        _ThreePopAdmix23Model15HMM,
+    }
 
-    if options.model == 'iso-3hmm':
-        return _Isolation3HMMModel(options)
+    assert options.model in table, \
+        'Unsupported model {0}'.format(options.model)
 
-    if options.model == 'iim-3hmm':
-        return _IsolationInitialMigration3HMMModel(options)
-
-    if options.model == 'iim-3hmm':
-        return _IsolationInitialMigrationModel(options)
-
-    if options.model == 'admix':
-        return _ThreePopAdmixModel(options)
-
-    if options.model == 'admix23-1pop':
-        return _OnePopAdmix23Model(options)
-
-    if options.model == 'admix23-2pop':
-        return _TwoPopAdmix23Model(options)
-
-    if options.model == 'admix23-2pop-1sample':
-        return _TwoPopAdmix23OneSampleModel(options)
-
-    if options.model == 'admix23':
-        return _ThreePopAdmix23Model(options)
-
-    if options.model == 'admix23-6hmm':
-        return _ThreePopAdmix23Model6HMM(options)
-
-    if options.model == 'admix23-15hmm':
-        return _ThreePopAdmix23Model15HMM(options)
-
-    assert False, 'Unsupported model {0}'.format(options.model)
+    return table[options.model](options)
